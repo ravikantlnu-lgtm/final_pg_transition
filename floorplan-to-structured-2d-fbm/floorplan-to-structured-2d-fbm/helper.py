@@ -14,11 +14,16 @@ import numpy as np
 import math
 import cv2
 
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor, Json
+import pandas as pd
+from types import SimpleNamespace
+
 import geoip2.database as geoip2_database
 import vertexai
 from vertexai.generative_models import GenerativeModel
 from google.cloud.storage import Client as CloudStorageClient
-from google.cloud import bigquery
 from fastapi.encoders import jsonable_encoder
 import google.auth.transport.requests
 from google.oauth2.service_account import IDTokenCredentials
@@ -172,19 +177,57 @@ def download_segmented_walls(plan_id, project_id, index, credentials, destinatio
     blob.download_to_filename(destination_path)
     return destination_path
 
-def load_bigquery_client(credentials):
-    bigquery_client = bigquery.Client.from_service_account_json(credentials["GBQServer"]["service_account_key"])
-    return bigquery_client
+_pg_pool = None
 
-def bigquery_run(credentials, bigquery_client, GBQ_query, job_config=dict()):
-    job_config = bigquery.QueryJobConfig(
-        destination_encryption_configuration=bigquery.EncryptionConfiguration(
-            kms_key_name=credentials["GBQServer"]["KMS_key"]
-        ),
-        **job_config
+def load_pg_pool(credentials):
+    global _pg_pool
+    pg = credentials["PostgreSQL"]
+    _pg_pool = ThreadedConnectionPool(
+        minconn=pg.get("min_pool_size", 2),
+        maxconn=pg.get("max_pool_size", 10),
+        host=pg["host"],
+        port=pg["port"],
+        database=pg["database"],
+        user=pg["user"],
+        password=pg["password"],
     )
-    query_output = bigquery_client.query(GBQ_query, job_config=job_config)
-    return query_output
+    logging.info("SYSTEM: PostgreSQL connection pool initialized")
+    return _pg_pool
+
+def pg_run(query, params=None):
+    conn = _pg_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            conn.commit()
+            if cur.description:
+                rows = cur.fetchall()
+                return [SimpleNamespace(**row) for row in rows]
+            return []
+    finally:
+        _pg_pool.putconn(conn)
+
+def pg_run_df(query, params=None):
+    conn = _pg_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            conn.commit()
+            if cur.description:
+                rows = cur.fetchall()
+                if rows:
+                    return pd.DataFrame(rows)
+                return pd.DataFrame(columns=[desc[0] for desc in cur.description])
+            return pd.DataFrame()
+    finally:
+        _pg_pool.putconn(conn)
+
+def to_jsonb(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return Json(value)
 
 def insert_model_2d(
     model_2d,
@@ -196,32 +239,11 @@ def insert_model_2d(
     user_id,
     project_id,
     target_drywalls,
-    bigquery_client,
+    pg_pool,
     credentials
     ):
-    GBQ_query = """
-    MERGE `drywall_takeoff.models` t
-    USING (
-        SELECT
-            @plan_id AS plan_id,
-            @project_id AS project_id,
-            @user_id AS user_id,
-            @page_number AS page_number,
-            @page_sections AS page_sections,
-            @page_section_number AS page_section_number,
-            @model_2d AS model_2d,
-            @scale AS scale,
-            @target_drywalls AS target_drywalls,
-    ) s
-    ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number and t.page_section_number = s.page_section_number
-    WHEN MATCHED THEN
-    UPDATE SET
-        model_2d = s.model_2d,
-        scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-        user_id = @user_id,
-        updated_at = CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN
-    INSERT (
+    query = """
+    INSERT INTO models (
         plan_id,
         project_id,
         user_id,
@@ -237,56 +259,45 @@ def insert_model_2d(
         updated_at
     )
     VALUES (
-        s.plan_id,
-        s.project_id,
-        s.user_id,
-        s.page_number,
-        s.page_sections,
-        s.page_section_number,
-        s.scale,
-        s.model_2d,
-        JSON '{}',
-        JSON '{}',
-        s.target_drywalls,
-        CURRENT_TIMESTAMP(),
-        CURRENT_TIMESTAMP()
-    );
+        %(plan_id)s,
+        %(project_id)s,
+        %(user_id)s,
+        %(page_number)s,
+        %(page_sections)s,
+        %(page_section_number)s,
+        %(scale)s,
+        %(model_2d)s,
+        '{}'::jsonb,
+        '{}'::jsonb,
+        %(target_drywalls)s,
+        NOW(),
+        NOW()
+    )
+    ON CONFLICT (project_id, plan_id, page_number, page_section_number)
+    DO UPDATE SET
+        model_2d = EXCLUDED.model_2d,
+        scale = COALESCE(NULLIF(EXCLUDED.scale, ''), models.scale),
+        user_id = EXCLUDED.user_id,
+        updated_at = NOW();
     """
-    job_config = dict(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
-            bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
-            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-            bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
-            bigquery.ScalarQueryParameter("page_sections", "INT64", page_sections),
-            bigquery.ScalarQueryParameter("page_section_number", "STRING", page_section_number),
-            bigquery.ScalarQueryParameter("scale", "STRING", scale),
-            bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
-            bigquery.ScalarQueryParameter("target_drywalls", "STRING", target_drywalls),
-        ]
+    params = dict(
+        plan_id=plan_id,
+        project_id=project_id,
+        user_id=user_id,
+        page_number=page_number,
+        page_sections=page_sections,
+        page_section_number=page_section_number,
+        scale=scale,
+        model_2d=to_jsonb(model_2d),
+        target_drywalls=target_drywalls,
     )
 
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
+    query_output = pg_run(query, params)
     return query_output
 
-def insert_model_2d_batch(rows, bigquery_client, credentials):
-    GBQ_query = """
-    MERGE `drywall_takeoff.models` t
-    USING UNNEST(@rows) s
-    ON LOWER(t.project_id) = LOWER(s.project_id)
-       AND LOWER(t.plan_id) = LOWER(s.plan_id)
-       AND t.page_number = s.page_number
-       AND t.page_section_number = s.page_section_number
-
-    WHEN MATCHED THEN
-    UPDATE SET
-        model_2d = SAFE.PARSE_JSON(s.model_2d),
-        scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-        user_id = s.user_id,
-        updated_at = CURRENT_TIMESTAMP()
-
-    WHEN NOT MATCHED THEN
-    INSERT (
+def insert_model_2d_batch(rows, pg_pool, credentials):
+    query = """
+    INSERT INTO models (
         plan_id,
         project_id,
         user_id,
@@ -302,54 +313,55 @@ def insert_model_2d_batch(rows, bigquery_client, credentials):
         updated_at
     )
     VALUES (
-        s.plan_id,
-        s.project_id,
-        s.user_id,
-        s.page_number,
-        s.page_sections,
-        s.page_section_number,
-        s.scale,
-        SAFE.PARSE_JSON(s.model_2d),
-        JSON '{}',
-        JSON '{}',
-        s.target_drywalls,
-        CURRENT_TIMESTAMP(),
-        CURRENT_TIMESTAMP()
+        %(plan_id)s,
+        %(project_id)s,
+        %(user_id)s,
+        %(page_number)s,
+        %(page_sections)s,
+        %(page_section_number)s,
+        %(scale)s,
+        %(model_2d)s,
+        '{}'::jsonb,
+        '{}'::jsonb,
+        %(target_drywalls)s,
+        NOW(),
+        NOW()
     )
+    ON CONFLICT (project_id, plan_id, page_number, page_section_number)
+    DO UPDATE SET
+        model_2d = EXCLUDED.model_2d,
+        scale = COALESCE(NULLIF(EXCLUDED.scale, ''), models.scale),
+        user_id = EXCLUDED.user_id,
+        updated_at = NOW();
     """
+    conn = _pg_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            for row in rows:
+                params = dict(
+                    plan_id=row["plan_id"],
+                    project_id=row["project_id"],
+                    user_id=row["user_id"],
+                    page_number=row["page_number"],
+                    page_sections=row["page_sections"],
+                    page_section_number=row["page_section_number"],
+                    scale=row["scale"],
+                    model_2d=to_jsonb(row["model_2d"]),
+                    target_drywalls=row["target_drywalls"],
+                )
+                cur.execute(query, params)
+            conn.commit()
+    finally:
+        _pg_pool.putconn(conn)
 
-    job_config = dict(
-        query_parameters=[
-            bigquery.ArrayQueryParameter(
-                "rows",
-                "STRUCT<\
-                    plan_id STRING,\
-                    project_id STRING,\
-                    user_id STRING,\
-                    page_number INT64,\
-                    page_sections INT64,\
-                    page_section_number STRING,\
-                    scale STRING,\
-                    model_2d JSON,\
-                    target_drywalls STRING\
-                >",
-                rows
-            )
-        ],
-    )
-
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
-    return query_output
-
-def load_templates(bigquery_client, credentials):
-    GBQ_query = f"SELECT * FROM `{credentials["GBQServer"]["table_name_sku"]}`"
-    product_templates = list(bigquery_run(credentials, bigquery_client, GBQ_query).result())
+def load_templates(pg_pool, credentials):
+    product_templates = pg_run("SELECT * FROM sku")
 
     logging.info("SYSTEM: Product Templates retrieved successfully")
     product_templates_target = list()
     cached_templates_sku = list()
     for product_template in product_templates:
-        product_template = dict(product_template)
+        product_template = vars(product_template)
         if product_template["sku_id"] in cached_templates_sku:
             continue
         cached_templates_sku.append(product_template["sku_id"])

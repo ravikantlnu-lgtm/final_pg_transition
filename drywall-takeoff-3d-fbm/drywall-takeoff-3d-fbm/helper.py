@@ -2,26 +2,68 @@ import json
 import logging
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
-from google.cloud import bigquery
+import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor, Json
+import pandas as pd
 from google.cloud.storage import Client as CloudStorageClient
 import google.auth.transport.requests
 from google.oauth2.service_account import IDTokenCredentials
 
 
-def load_bigquery_client(credentials):
-    bigquery_client = bigquery.Client.from_service_account_json(credentials["GBQServer"]["service_account_key"])
-    return bigquery_client
+_pg_pool = None
 
-def bigquery_run(credentials, bigquery_client, GBQ_query, job_config=dict()):
-    job_config = bigquery.QueryJobConfig(
-        destination_encryption_configuration=bigquery.EncryptionConfiguration(
-            kms_key_name=credentials["GBQServer"]["KMS_key"]
-        ),
-        **job_config
+def load_pg_pool(credentials):
+    global _pg_pool
+    pg = credentials["PostgreSQL"]
+    _pg_pool = ThreadedConnectionPool(
+        minconn=pg.get("min_pool_size", 2),
+        maxconn=pg.get("max_pool_size", 10),
+        host=pg["host"],
+        port=pg["port"],
+        database=pg["database"],
+        user=pg["user"],
+        password=pg["password"],
     )
-    query_output = bigquery_client.query(GBQ_query, job_config=job_config)
-    return query_output
+    logging.info("SYSTEM: PostgreSQL connection pool initialized")
+    return _pg_pool
+
+def pg_run(query, params=None):
+    conn = _pg_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            conn.commit()
+            if cur.description:
+                rows = cur.fetchall()
+                return [SimpleNamespace(**row) for row in rows]
+            return []
+    finally:
+        _pg_pool.putconn(conn)
+
+def pg_run_df(query, params=None):
+    conn = _pg_pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            conn.commit()
+            if cur.description:
+                rows = cur.fetchall()
+                if rows:
+                    return pd.DataFrame(rows)
+                return pd.DataFrame(columns=[desc[0] for desc in cur.description])
+            return pd.DataFrame()
+    finally:
+        _pg_pool.putconn(conn)
+
+def to_jsonb(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return Json(value)
 
 def sha256(path, chunk_size=8192):
     sha256 = hashlib.sha256()
@@ -70,94 +112,49 @@ def insert_model_2d(
     if not page_section_number:
         page_section_number = 'I'
     if not page_sections:
-        GBQ_query = f"SELECT page_sections FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number} AND page_section_number = '{page_section_number}';"
-        query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-        page_sections = list(query_output)[0].page_sections
+        query_output = pg_run(
+            "SELECT page_sections FROM models WHERE LOWER(project_id) = LOWER(%(project_id)s) AND LOWER(plan_id) = LOWER(%(plan_id)s) AND page_number = %(page_number)s AND page_section_number = %(page_section_number)s;",
+            dict(project_id=project_id, plan_id=plan_id, page_number=page_number, page_section_number=page_section_number)
+        )
+        page_sections = query_output[0].page_sections
     if not model_2d.get("metadata", None):
-        GBQ_query = f"SELECT model_2d.metadata FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number} AND page_section_number = '{page_section_number}';"
-        query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-        metadata = list(query_output)[0].metadata
+        query_output = pg_run(
+            "SELECT model_2d->'metadata' AS metadata FROM models WHERE LOWER(project_id) = LOWER(%(project_id)s) AND LOWER(plan_id) = LOWER(%(plan_id)s) AND page_number = %(page_number)s AND page_section_number = %(page_section_number)s;",
+            dict(project_id=project_id, plan_id=plan_id, page_number=page_number, page_section_number=page_section_number)
+        )
+        metadata = query_output[0].metadata
         metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
         model_2d["metadata"] = metadata
-    GBQ_query = """
-    MERGE `drywall_takeoff.models` t
-    USING (
-        SELECT
-            @plan_id AS plan_id,
-            @project_id AS project_id,
-            @user_id AS user_id,
-            @page_number AS page_number,
-            @page_sections AS page_sections,
-            @page_section_number AS page_section_number,
-            @model_2d AS model_2d,
-            @source AS source,
-            @target_drywalls AS target_drywalls,
-            @scale AS scale,
-    ) s
-    ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number AND t.page_section_number = s.page_section_number
-    WHEN MATCHED THEN
-    UPDATE SET
-        model_2d = s.model_2d,
-        scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-        user_id = @user_id,
-        updated_at = CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN
-    INSERT (
-        plan_id,
-        project_id,
-        user_id,
-        page_number,
-        page_sections,
-        page_section_number,
-        scale,
-        model_2d,
-        model_3d,
-        takeoff,
-        source,
-        target_drywalls,
-        created_at,
-        updated_at
+    query = """
+    INSERT INTO models (
+        plan_id, project_id, user_id, page_number, page_sections, page_section_number,
+        scale, model_2d, model_3d, takeoff, source, target_drywalls, created_at, updated_at
+    ) VALUES (
+        %(plan_id)s, %(project_id)s, %(user_id)s, %(page_number)s, %(page_sections)s, %(page_section_number)s,
+        %(scale)s, %(model_2d)s, '{}'::jsonb, '{}'::jsonb, %(source)s, %(target_drywalls)s, NOW(), NOW()
     )
-    VALUES (
-        s.plan_id,
-        s.project_id,
-        s.user_id,
-        s.page_number,
-        s.page_sections,
-        s.page_section_number,
-        s.scale,
-        s.model_2d,
-        JSON '{}',
-        JSON '{}',
-        s.source,
-        s.target_drywalls,
-        CURRENT_TIMESTAMP(),
-        CURRENT_TIMESTAMP()
-    );
+    ON CONFLICT (project_id, plan_id, page_number, page_section_number) DO UPDATE SET
+        model_2d = EXCLUDED.model_2d,
+        scale = COALESCE(NULLIF(EXCLUDED.scale, ''), models.scale),
+        user_id = EXCLUDED.user_id,
+        updated_at = NOW();
     """
-    job_config = dict(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
-            bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
-            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-            bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
-            bigquery.ScalarQueryParameter("page_sections", "INT64", page_sections),
-            bigquery.ScalarQueryParameter("page_section_number", "STRING", page_section_number),
-            bigquery.ScalarQueryParameter("scale", "STRING", scale),
-            bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
-            bigquery.ScalarQueryParameter("source", "STRING", GCS_URL_floorplan_page),
-            bigquery.ScalarQueryParameter("target_drywalls", "STRING", GCS_URL_target_drywalls_page)
-        ]
+    params = dict(
+        plan_id=plan_id, project_id=project_id, user_id=user_id,
+        page_number=page_number, page_sections=page_sections,
+        page_section_number=page_section_number, scale=scale,
+        model_2d=to_jsonb(model_2d), source=GCS_URL_floorplan_page,
+        target_drywalls=GCS_URL_target_drywalls_page
     )
-
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
-    return query_output
+    return pg_run(query, params)
 
 def is_duplicate(bigquery_client, credentials, pdf_path, project_id):
     sha_256 = sha256(pdf_path)
-    GBQ_query = f"SELECT plan_id, sha256, status FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    for plan_target in list(query_output):
+    query_output = pg_run(
+        "SELECT plan_id, sha256, status FROM plans WHERE LOWER(project_id) = LOWER(%(project_id)s);",
+        dict(project_id=project_id)
+    )
+    for plan_target in query_output:
         if plan_target.sha256 == sha_256:
             if plan_target.status == "FAILED":
                 delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
@@ -166,9 +163,10 @@ def is_duplicate(bigquery_client, credentials, pdf_path, project_id):
     return False
 
 def delete_plan(credentials, bigquery_client, plan_id, project_id):
-    GBQ_query = f"DELETE FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    return query_output
+    return pg_run(
+        "DELETE FROM plans WHERE LOWER(project_id) = LOWER(%(project_id)s) AND LOWER(plan_id) = LOWER(%(plan_id)s);",
+        dict(project_id=project_id, plan_id=plan_id)
+    )
 
 def load_floorplan_to_structured_2d_ID_token(credentials):
     auth_req = google.auth.transport.requests.Request()
@@ -181,14 +179,13 @@ def load_floorplan_to_structured_2d_ID_token(credentials):
     return id_token
 
 def load_templates(bigquery_client, credentials):
-    GBQ_query = f"SELECT * FROM `{credentials["GBQServer"]["table_name_sku"]}`"
-    product_templates = list(bigquery_run(credentials, bigquery_client, GBQ_query).result())
+    product_templates = pg_run("SELECT * FROM sku")
 
     logging.info("SYSTEM: Product Templates retrieved successfully")
     product_templates_target = list()
     cached_templates_sku = list()
     for product_template in product_templates:
-        product_template = dict(product_template)
+        product_template = vars(product_template)
         if product_template["sku_id"] in cached_templates_sku:
             continue
         cached_templates_sku.append(product_template["sku_id"])

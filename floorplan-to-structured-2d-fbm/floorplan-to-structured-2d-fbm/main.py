@@ -15,7 +15,6 @@ random.seed(0)
 
 import google.auth.transport.requests
 from google.oauth2.service_account import IDTokenCredentials
-from google.cloud import secretmanager
 
 from preprocessing import preprocess
 from modeller_2d import FloorPlan2D
@@ -29,7 +28,7 @@ from helper import (
     download_segmented_walls,
     insert_model_2d,
     insert_model_2d_batch,
-    load_bigquery_client,
+    load_pg_pool,
     load_templates,
     load_section_from_page,
     apply_pixel_margin_to_bounding_box,
@@ -169,7 +168,7 @@ def page_to_structured_2d(
         user_id,
         project_id,
         floorplan_baseline_page_source,
-        bigquery_client,
+        pg_pool,
         credentials,
     )
     logging.info(f"SYSTEM: A 2D Model of the Floorplan from PAGE: {page_number} and SECTION: {page_section_number} Generated Successfully")
@@ -203,8 +202,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-bigquery_client = load_bigquery_client(CREDENTIALS)
-DRYWALL_TEMPLATES = load_templates(bigquery_client, CREDENTIALS)
+pg_pool = load_pg_pool(CREDENTIALS)
+DRYWALL_TEMPLATES = load_templates(None, CREDENTIALS)
 
 @app.post("/floorplan_to_structured_2d")
 async def floorplan_to_structured_2d(request: Request):
@@ -237,7 +236,7 @@ async def floorplan_to_structured_2d(request: Request):
             user_id,
             project_id,
             "gs://",
-            bigquery_client,
+            pg_pool,
             CREDENTIALS,
         )
         logging.warning(f"SYSTEM: Floorplan Rejected: Page Number: {page_number}")
@@ -282,7 +281,7 @@ async def floorplan_to_structured_2d(request: Request):
             user_id,
             project_id,
             "gs://",
-            bigquery_client,
+            pg_pool,
             CREDENTIALS,
         )
         logging.error(f"SYSTEM: Floorplan Segmentation FAILED: Page Number: {page_number}")
@@ -321,5 +320,5 @@ async def floorplan_to_structured_2d(request: Request):
             #rows_insert_model_2d = list()
             #for future in futures:
             #    rows_insert_model_2d.append(future.result())
-            #insert_model_2d_batch(rows_insert_model_2d, bigquery_client, CREDENTIALS)
+            #insert_model_2d_batch(rows_insert_model_2d, pg_pool, CREDENTIALS)
     return respond_with_UI_payload(dict(status="SUCCESS", message="Floor Plan extraction completed"))
