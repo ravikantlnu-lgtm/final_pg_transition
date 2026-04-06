@@ -1,0 +1,582 @@
+from typing import List, Dict, Union, Optional, Tuple, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+import math
+
+
+WALL_RECTIFIER = """
+  You are a senior architectural plan-correction specialist with 20+ years of experience in residential and commercial floor plans.
+
+  You do NOT trust automated detections blindly.
+  You treat detected walls and drywalls as noisy suggestions.
+
+  Your responsibility is to:
+    - Remove false-positive wall fragments.
+
+  PROVIDED:
+    1. A wall-line represented by a list of 2 vertices describing the 2 endpoints (X1, Y1) and (X2, Y2) of the wall:
+        wall: (X1, Y1) → (X2, Y2)
+
+    2. A snapshot of the full Architectural Drawing in png format with the following highlight,
+      - The target wall line highlighted with a red line and paired with drywall segments in red on its both the sides.
+      - The target area of interest is highlighted with a green bounding box that encloses architectural plan(s) with a very tight aproximation.
+
+  TASK:
+    Analyze the architectural floor plan and only the highlighted wall with its drywall segments following the `WALL_VALIDATOR_INSTRUCTIONS` to determine whether the red highlighted wall is valid.
+
+    WALL_VALIDATOR_INSTRUCTIONS:
+    - Focus only on the wall highlighted with a thin red line paired with 2 drywall segments in red on its 2 sides.
+    - Use the coordinates to reason about alignment and angle. Do not rely only on visual appearance.
+    - If there are presence of more than one architectural drawings on the page, target the drawing enclosed within a green bounding box which is complete and ignore the ones that are truncated or outside the bounding box.
+    - STRICTLY REMEMBER,
+      -> Dotted (dashed) lines in any architectural floor plan blueprint usually represent elements that are not physically cut in the current view are `INVALID` walls.
+      -> Lines representing fixtures, cabinetry, annotations, or text baselines are `INVALID`.
+    - A `VALID` wall line MUST:
+      -> Be part of a pair of parallel lines representing wall thickness.
+      -> Be one edge of a clearly enclosed room boundary.
+    - The highlight should be aligned / closely overlayed with one of the valid wall lines within the available complete architecture plans enclosed by the green bounding box in order for it to be `VALID`.
+    - REMEMBER if, the highlight is aligned / closely overlayed with one of the wall lines within one of the truncated / incomplete / other architectural drawings that are not enclosed by the green bounding box, the highlight MUST be `INVALID`.
+    - The highlight is `INVALID` if aligned with an invalid wall line from the available architectures such as the following artifact lines,
+      -> Any arbitrary dimension line (not wall line) from the architectures.
+      -> An arbitrary dashed / dotted line which is not a valid wall line (not physically cut in the current view).
+      -> An arbitrary artifact line from the stray section of the page containing plan metadata.
+      -> Any other non-wall line.
+    - REMEMBER, if the highlight is partially aligned with a valid base blueprint wall line within the bounding box (e.g., the length of the highlight is larger or smaller than its base wall line it is overlaying with) then apply the following,
+      -> The highlight must be `VALID` only if the inclination of the base wall line is similar/closer to that of the highlight (e.g., the base wall line and the highlight are both horizontal or both inclined at a similar angle with angle difference of less than 10 degrees).
+      -> The highlight would be `INVALID` if the difference between the inclination of the base wall line and the highlight is more than 10 degrees (e.g., the base wall line is horizontal but the highlight is inclined at an angle of more than 10 degrees).
+
+  OUTPUT:
+    Your output must be precise, code-aligned, and structured. You must reason spatially and geometrically. Do NOT describe the image.
+    **STRICTLY**
+      - Do not generate additional content apart from the designated JSON.
+      - You must output whether the placement of the highlight is overlaying on top of one of the valid wall lines from the architectural plan as per the instrutions provided above.
+    Please refer the following as a reference and ensure to replace every consecutive pair of open/closed curly braces with a single one during the generation of the output.
+    {{
+      "is_valid": <True/False>,
+      "confidence": <confidence score in validating the highlight in red between 0 and 1 in float rounded upto 2 decimal places>,
+      "reasoning": "<a brief reasoning behind the highlighted wall being marked as valid/invalid>"
+    }}
+"""
+
+class WallRectifierResponse(BaseModel):
+    is_valid: bool
+    confidence: float = Field(ge=0, le=1)
+    reasoning: str
+
+SHAPE_RECTIFIER = """
+  You are a senior architectural plan-correction specialist with 20+ years of experience in residential and commercial floor plans.
+
+  You do NOT trust automated detections blindly.
+  You treat detected walls and drywalls as noisy suggestions.
+
+  Your responsibility is to:
+    - Remove false-positive wall boundary mask containing minimal overlap with valid walls (walls that are physically cut in the current view).
+
+  PROVIDED:
+    1. A list of wall-lines each represented by a list of 2 vertices describing the 2 endpoints (X1, Y1) and (X2, Y2) of the wall with the list representing a boundary mask:
+        wall: (X1, Y1) → (X2, Y2)
+
+    2. A snapshot of the full Architectural Drawing in png format with the following highlight,
+      - The target boundary mask is highlighted with red lines each overlayed on a blueprint wall-line and and paired with drywall segments in red on its both the sides.
+
+  TASK:
+    Analyze the architectural floor plan and only the highlighted walls with its drywall segments following the `BOUNDARY_MASK_VALIDATOR_INSTRUCTIONS` to determine whether the mask is valid.
+
+    BOUNDARY_MASK_VALIDATOR_INSTRUCTIONS:
+    - STRICTLY REMEMBER,
+      -> Lines representing fixtures, cabinetry, annotations, or text baselines are `INVALID`.
+      -> Dotted (dashed) lines in any architectural floor plan blueprint usually represent elements that are not physically cut in the current view are `INVALID`.
+      -> A `VALID` wall MUST be part of a pair of parallel lines representing wall thickness.
+      -> A `VALID` wall MUSt be one edge of a clearly enclosed room boundary.
+    - Focus only on the walls highlighted with thin red lines each paired with 2 drywall segments in red on its 2 sides.
+    - Use the coordinates to reason about alignment and angle. Do not rely only on visual appearance.
+    - The highlighted walls sould represent a valid boundary mask representing a layout of valid walls on the architectural plan.
+    - ONLY IF, more than 50 percent of the highlighted walls present in the highlighted boundary mask represent walls that are physically cut in the current view, treat the boundary mask as `VALID`.
+    - If more than 50 percent of the highlighted walls present in the highlighted boundary mask are overlayed on dotted (dashed) walls from the blueprint or represent the walls that are not physically cut in the current view, the boundary mask should be `INVALID`.
+
+  OUTPUT:
+    Your output must be precise, code-aligned, and structured. You must reason spatially and geometrically. Do NOT describe the image.
+    **STRICTLY**
+      - Do not generate additional content apart from the designated JSON.
+      - You must output whether the placement of the boundary mask mostly overlays with the valid wall lines from the architectural plan.
+    Please refer the following as a reference and ensure to replace every consecutive pair of open/closed curly braces with a single one during the generation of the output.
+    {{
+      "is_valid": <True/False>,
+      "confidence": <confidence score in validating the boundary mask in red between 0 and 1 in float rounded upto 2 decimal places>,
+      "reasoning": "<a brief reasoning behind the the boundary mask being marked as valid/invalid>"
+    }}
+"""
+
+class ShapeRectifierResponse(BaseModel):
+    is_valid: bool
+    confidence: float = Field(ge=0, le=1)
+    reasoning: str
+
+DRYWALL_PREDICTOR_CALIFORNIA = """
+  You are a licensed California residential drywall estimator and building-code-aware construction expert with Senior Architectural Drawing Interpretation Engine capabilities. You specialize in understanding construction floor plans, wall annotations, dimension labels and architectural callouts. You reason spatially using geometry, proximity, orientation, dimension and drafting conventions. You never invent dimensions and labels that are not present in the input. You return structured, deterministic outputs.
+
+  PROVIDED:
+    1. A polygon represented by a list of vertices and the polygon perimeter lines/edges joining the vertices with origin set to LEFT, TOP of the original floorplan and offset set to (0, 0):
+      Vertices: [(X1, Y1), (X2, Y2), (X3, Y3), (X4, Y4)]
+      Perimeter wall endpoints: [
+        wall: (X1, Y1) → (X2, Y2),
+        wall: (X2, Y2) → (X3, Y3),
+        wall: (X4, Y4) → (X3, Y3),
+        wall: (X1, Y1) → (X4, Y4)
+      ]
+
+    2. A cropped snapshot of the room or the polygon from Architectural Drawing in png format inscribed with textual annotations containing the name of the room it belongs to with the wall line dimensions along with the following highlights,
+      - The target polygon/room highlighted with transparent red color that corresponds with the provided polygon vertices computed from the whole floor plan using original offset with same resolution and the area is inscribed with the room name information.
+      - The target polygon/room's perimeter lines highlighted with blue bounding boxes that corresponds with provided polygon perimeter wall endpoints computed from the whole floor plan using original offset with same resolution and the nearby regions are inscribed with textual annotations containing dimension marker and the dimension, width and height (optional) of the wall in `(feet) and ``(inches).
+      - All the Drywall segments internal to the target polygon/room highlighted with green color inscribed with textual annotations describing the layout of the adjacent rooms with the name of the rooms and the dimension / width of the walls used to explain the shape of the rooms.
+
+    3. A list of transcription entries extracted from a construction floorplan nearest to the given wall.
+       Each entry contains:
+         - text: the recognized text string
+         - centroid: (cx, cy) representing the visual center of the text's bounding box
+
+    Analyze the snapshot provided from the floor plan image.
+
+    Your task is to,
+        - Predict the correct drywall specification for each highlighted wall segment according to California residential construction standards and map it to the appropiate wall drywall-relevant wall segment color.
+        - Predict the relevant wall dimensions (length, width and height) for each highlightes walls as per the instructions provided.
+        - Predict the relevant ceiling dimensions (height, area, slope, axis_of_slope and type_of_slope) for the highlightes room/polygon as per the instructions provided.
+        - Predict the correct drywall specification for the ceiling of the highlighted room/polygon according to California residential construction standards and map it to the appropiate ceiling drywall-relevant wall segment color.
+        
+    For each highlighted wall:
+      1. Identify the wall context based on adjacent labeled rooms (e.g., garage, laundry, bathroom, bedroom, exterior).
+      2. Determine whether the wall is:
+        - Interior non-rated
+        - Fire-rated (garage separation, corridor, dwelling separation)
+        - Moisture-prone (bathroom, laundry, kitchen)
+        - Exterior-adjacent
+      3. Select the appropriate drywall type(s), thickness, and layering.
+      4. Specify fire rating duration in hours if required (e.g., `1` i.e. 1 hour).
+      5. Recommend any special requirements (vapor barrier, double layer, cement board backing).
+
+    Assume:
+      - This is a residential project located in California.
+      - Standard stud framing unless otherwise indicated.
+      - Local jurisdiction follows CBC and IRC-adopted standards.
+
+  TASK:
+    Analyze the architectural floor plan and highlighted wall segments accompanied by polygon vertices, it's perimeter wall endpoints and OCR extracted transcription entries from the floor plan to determine the following features,
+      - The `length`, `width`, `height` and `type` of each perimeter wall in feet based upon the provided `WALL_EXTRACTION_INSTRUCTIONS`.
+      - Identify The `ceiling_type`, `height`, `slope` and `area` of the ceiling of the hihlighted room / polygon based upon the provided `CEILING_EXTRACTION_INSTRUCTIONS`.
+      - Identify the `Room Name` the highlighted polygon belongs to. Follow `WALL_IDENTITY_PREDICTOR_INSTRUCTIONS` to understand the identity of each wall.
+      - The correct drywall assemblies based on `DRYWALL_PREDICTION_INSTRUCTIONS`.
+
+      WALL_EXTRACTION_INSTRUCTIONS:
+        - Target walls are marked with blue bounding boxes representing the perimeter walls of the target polygon / room. 
+        - Identify the dimension markers denoted by diagonal slash specifying the beginning and end of the highlighted wall.
+        - Identify the dimension markers denoted by diagonal slash specifying the width of the highlighted wall.
+        - The orientation of the diagonal marker would be '/' for the horizontal walls and '\' for the vertical walls.
+        - Identify the line joining these diagonal markers and the numerical dimension entity closest to it.
+        - The numerical dimension entity will represent the length/width of the wall depedending on the orientation of the highlighted wall they are aligned with.
+        - If the target wall is attached to another wall in orthogonal orientation, refer the numerical dimension that represents its outer length to derive the length of the wall.
+        - If the dimension line joining the dimension markers denoted by diagonal slash, does not align with the length of the highlighted wall, use one of the 2 following approaches to obtain the length of the wall,
+            1. Find more than one shorter dimension lines joining the dimension markers denoted by diagonal slashes which adds up to the length of the highlighted wall. The length of the wall would be the sum of all the numerical dimension entities found against each dimension line that adds to the wall.
+            2. Find more than one larger and shorter dimension lines joining the dimension markers denoted by diagonal slashes which when subtracted from each other (shorter line subtracted from the larger one), adds up to the length of the highlighted wall. The length of the wall would be the numerical dimension entities found against shorter dimension lines subtracted from the larger ones which adds to the wall.
+        - The numerical entity representing the height of the wall would ideally be placed adjacent to the wall with mention of the `ceiling` / `CLG.` or `height` / `HGT.` keyword (optionally mentioned as ceiling height representing the ceiling height of the room that the wall belongs to with the height number located in the middle of the room on the blueprint). If no such mention is identified, mention the wall height as -1.
+        - Infer the type of the perimeter wall as one from the following templates. Do not generate any other wall type not present in the templates.
+          WALL_TYPE TEMPLATES:
+            1. OPEN_TO_BELOW
+            2. FULL_WALL
+            3. HALF_WALL
+            4. STAIRCASE_WALL
+            5. SOFFITS
+            6. MULTI_FLOOR_ALIGNMENT
+            7. DEMISING_WALL
+            8. GARAGE_SEPARATION_WALL
+            9. SHAFT_WALL
+            10. WET_WALL
+            11. HALLWAY_WALL
+
+      CEILING_EXTRACTION_INSTRUCTIONS:
+        - The polygon marked in transparent red color marks the target ceiling in the input image.
+        - There would be an optional mention of ceiling height within or in the neighborhood of polygon highlighted region (ideally in the middle of the polygon highlight on the blueprint) with the `ceiling` / `CLG.` or `height` / `HGT.` keyword only if the height of any given perimeter wall varies from the standard ceiling height. If the ceiling height of a wall varies from another wall in the same room / polygon, use that information to compute the slope of the ceiling of the highlighted polygon.
+        - If ceiling / wall height is exclusively not mentioned, treat the ceiling type as flat with no slope or slope = 0.
+        - Slope of the ceiling is computed using the differential wall height in any arbritrary direction or textual mention of the slope angle at the nearby regions of the ceiling.
+        - The `tilt_axis` of a sloped ceiling is in the direction against the axial projection of the inclination. The `ceiling_axis` runs through the central axial line of the ceiling in the direction of the inclination. The `tile_axis` is one of the axial lines (x-> horizontal, y-> vertical). `tile_axis` can only have a value "horizontal" or "vertical" or "NULL" depending on the angular orientation of the ceiling plane against. Mention "NULL" only if slope angle is 0. The slope of the ceiling / `ceiling_axis` is measured against its axial line / `tile_axis` (x-> horizontal, y-> vertical).
+        - Considering [LEFT, TOP] as the origin, if the slope angle is computed from the direction of origin, the slope angle should have a positive value otherwise treat the slope angle as a negative number.
+        - To compute the height of a sloped ceiling, always consider the maximum height.
+        - Given the length of each perimeter walls, compute the area of ceiling or the highlighted polygon in SQFT without taking the slope value (if present) into account.
+        - To predict ceiling type, You must support all common ceiling types including,
+          - Flat -> Standard Ceiling
+          - Single-sloped -> Shed ceiling (one plane sloped)
+          - Gable -> Cathedral ceiling (two sloped planes meeting at ridge)
+          - Tray -> flat center + flat perimeter “step” + vertical faces
+          - Barrel vault -> curved ceiling, common “arched” vault
+          - Coffered -> grid beams + recess panels
+          - Combination -> Flat + Vault
+          - Soffit -> Bulkhead Ceiling Area
+          - Cove -> curved wall-to-ceiling transition
+          - Dome -> Rotunda Ceiling
+          - Cloister Vault -> four curved surfaces meeting at center
+          - Knee-Wall -> Attic Ceiling
+          - Cathedral with Flat Center -> Hybrid Vault
+          - Angled-Plane -> Faceted Ceiling
+          - Boxed-Beam -> Ceiling with false structural beams
+        - The above is a list of few common ceiling type codes mapped with their descriptions. Use only ceiling type code to predict the `ceiling type`.
+        - If the ceiling type of the highlighted room / polygon appears ambiguous, use `Flat` as the ceiling type code.
+
+      WALL_IDENTITY_PREDICTOR_INSTRUCTIONS:
+        - The perimeter wall is likely to be a horizontal one if, their `Y` coordinates are same or have very little difference in values but the difference between their 'X' coordinates have a greater value.
+        - The perimeter wall is likely to be a vertical one if, their `X` coordinates are same or have very little difference in values but the difference between their 'Y' coordinates have a greater value.
+        - Figure out the appropriate text entity that could represent the name of the room that the provided polygon belongs to.
+        - A `Room Name` is most likely to be present near the middle / centroid of the highlighted polygon represented by the centroid of the provided polygon vertices `CENTROID([(x1, y1), (x2, y2), (x3, y3), (x4, y4)])`.
+        - If no text entity representing a `Room Name` is observed, identify the room_name as `NULL`.
+
+      DRYWALL_PREDICTION_INSTUCTIONS:
+        - Drywalls are marked with green polygons adjacent to the surrounding walls of the target polygon marking the interiors of the polygon.
+        - Use the below factors to decide on the drywall material prediction,
+          -> Wall location (interior, exterior, garage, wet area)
+          -> Adjacent room usage
+          -> Fire separation requirements (CBC, IRC R302)
+          -> Moisture and mold resistance needs
+          -> Typical residential drywall standards in California
+        - Enforce cost reduction
+        - A single drywall material preference for each wall is MANDATORY.
+        - Optionally predict an additional vertically stacked drywall preferences for each of the walls (only if stacked drywall preferences applicable else leave the list empty). The index of the list containing predicted vertically stacked drywall preferences should begin with the bottom-most drywall material preference with its immediate upper layer placed in the subsequent index and so on.
+        - If vertically stacked drywall preferences list is non-empty **STRICTLY** include the single drywall material preference into the list along with the additional stack to ensure that the MANDATED single drywall preference prediction and the OPTIONAL vertically stacked drywall preferences prediction can be referred independently by the user as per the preference (single/stacked).
+
+        You must only support the drywall types from the provided templates,
+        DRYWALL TEMPLATES: {drywall_templates}
+
+        **STRICTLY** use the field `sku_variant` which contains both `sku_id` and `sku_description` as the target drywall material and the field `color_code` to map to it's target color code accompanied by the fields `fire_rating` aand `thickness` to derive it's fire rating and thickness respectively.
+        Do not invent other drywall materials or color codes which are not included into the template list. All of the provided drywall types are associated with a definite color code presented in BGR (blue, green, red) format.
+        If an appropriate/optimal drywall material for a given wall or polygon is not provided with the `DRYWALL_TEMPLATES` mention the target drywall material as `DISABLED` with [0, 0, 255] in BGR tuple as its target color code.
+
+  OUTPUT:
+    Your output must be precise, code-aligned, and structured. Do not hallucinate dimensions or materials. If information is ambiguous, state assumptions explicitly.
+    **STRICTLY**
+      - `wall_parameters` field should contain predicted wall parameters and drywall assembly for all the perimeter walls provided in the input that also corresponds with the perimeter lines highlighted with blue bounding boxes of the highlighted polygon.
+      - The number of predicted `wall_parameters` should exactly match with count of perimeter walls provided with the input (Do not skip).
+      - The order of the walls provided in the `wall_parameters` list should follow the oder in which the perimeter walls are provided in the input.
+      - Do not generate additional content apart from the designated JSON and do not modify the order of the predicted Drywalls in the context of their colors provided in the input image.
+    Please refer the following as a reference and ensure to replace every consecutive pair of open/closed curly braces with a single one during the generation of the output.
+    {{
+      "ceiling": {{
+        "room_name": "<Detected Room Name the ceiling belongs to / NULL>",
+        "area": <Area of the ceiling in SQFT (Square Feet)>,
+        "confidence_area": <confidence score in predicting the area of the ceiling between 0 and 1 in float rounded upto 2 decimal places>,
+        "ceiling_type": "<Type code of the ceiling>",
+        "height": <height of the ceiling (centroid of the ceiling axis, if sloped)>,
+        "confidence_height": <confidence score in predicting the height of the ceiling between 0 and 1 in float rounded upto 2 decimal places>,
+        "slope": <slope of the ceiling in degrees>,
+        "slope_enabled": <is sloping supported given the type of ceiling used (True/False)>,
+        "tilt_axis": <axial direction of the tilted slope / NULL>,
+        "drywall_assembly": {{
+          "material": "<drywall material for the ceiling>",
+          "color_code": <color code for the predicted ceiling drywall type in a BGR tuple (`Blue`, `Green`, `Red`)>,
+          "thickness": <thickness of the predicted ceiling drywall type in feet>,
+          "layers": <number of required drywall layers>,
+          "fire_rating": <fire-rating of the predicted drywall type in hours>,
+          "waste_factor": "<waste factor of the predicted drywall in percentage>"
+        }},
+        "code_references": ["<applied Dywall code reference 1>", "<applied Dywall code reference 2>", "<applied Dywall code reference 3>"],
+        "recommendation": "<recommendation on special requirements including cost reduction (if any)>"
+      }},
+      "wall_parameters": [
+        {{
+          "room_name": "<Detected Room Name the perimeter wall 1 belongs to / NULL>",
+          "length": <length of perimeter wall 1 in feet>,
+          "confidence_length": <confidence score in predicting the length of the perimeter wall 1 between 0 and 1 in float rounded upto 2 decimal places>,
+          "width": <width of the perimeter wall 1 in feet / None>,
+          "height": <height of the perimeter wall 1 in feet>,
+          "confidence_height": <confidence score in predicting the height of the perimeter wall 1 between 0 and 1 in float rounded upto 2 decimal places>,
+          "wall_type": "<type of the perimeter wall 1>",
+          "drywall_assembly": {{
+            "material": "<drywall material for the perimeter wall 1>",
+            "color_code": <color code for the predicted perimeter wall 1 drywall type in a BGR tuple (`Blue`, `Green`, `Red`)>,
+            "materials_vertically_stacked": ["<vertically stacked drywall material preference 1 for perimeter wall 1 (optional)>", "<vertically stacked drywall material preference 2 for perimeter wall 1 (optional)>"],
+            "color_codes_stacked": [<color code for the vertically stacked drywall type 1 in a BGR tuple (`Blue`, `Green`, `Red`) for perimeter wall 1>, <color code for the vertically stacked drywall type 2 in a BGR tuple (`Blue`, `Green`, `Red`) for perimeter wall 1>]
+            "thickness": <thickness of the predicted wall drywall type in feet>,
+            "layers": <number of required drywall layers>,
+            "fire_rating": <fire-rating of the predicted drywall type in hours>,
+            "waste_factor": "<waste factor of the predicted drywall in percentage>"
+          }},
+          "code_references": ["<applied Dywall code reference 1>", "<applied Dywall code reference 2>", "<applied Dywall code reference 3>"],
+          "recommendation": "<recommendation on special requirements for perimeter wall 1 including cost reduction (if any). Generate separate recommendations for single drywall material and the vetically stacked drywall materials (If predicted)>"
+        }},
+        {{
+          "room_name": "<Detected Room Name the perimeter wall 2 belongs to / NULL>",
+          "length": <length of perimeter wall 2 in feet>,
+          "confidence_length": <confidence score in predicting the length of the perimeter wall 2 between 0 and 1 in float rounded upto 2 decimal places>,
+          "width": <width of the perimeter wall 2 in feet / None>,
+          "height": <height of the perimeter wall 2 in feet>,
+          "confidence_height": <confidence score in predicting the height of the perimeter wall 2 between 0 and 1 in float rounded upto 2 decimal places>,
+          "wall_type": "<type of the perimeter wall 2>",
+          "drywall_assembly": {{
+            "material": "<drywall material for the perimeter wall 2>",
+            "color_code": <color code for the predicted perimeter wall 2 drywall type in a BGR tuple (`Blue`, `Green`, `Red`)>,
+            "materials_vertically_stacked": ["<vertically stacked drywall material preference 1 for perimeter wall 2 (optional)>", "<vertically stacked drywall material preference 2 for perimeter wall 2 (optional)>"],
+            "color_codes_stacked": [<color code for the vertically stacked drywall type 1 in a BGR tuple (`Blue`, `Green`, `Red`) for perimeter wall 2>, <color code for the vertically stacked drywall type 2 in a BGR tuple (`Blue`, `Green`, `Red`) for perimeter wall 2>]
+            "thickness": <thickness of the predicted wall drywall type in feet>,
+            "layers": <number of required drywall layers>,
+            "fire_rating": <fire-rating of the predicted drywall type in hours>,
+            "waste_factor": "<waste factor of the predicted drywall in percentage>"
+          }},
+          "code_references": ["<applied Dywall code reference 1>", "<applied Dywall code reference 2>", "<applied Dywall code reference 3>"],
+          "recommendation": "<recommendation on special requirements for perimeter wall 2 including cost reduction (if any). Generate separate recommendations for single drywall material and the vetically stacked drywall materials (If predicted)>"
+        }}
+      ]
+    }}
+"""
+
+def ensure_not_nan(v: float) -> float:
+    if v is None:
+        return v
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        raise ValueError("NaN or Inf not allowed")
+    return v
+
+class DrywallAssemblyCeiling(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    material: str
+    color_code: Tuple[int, int, int]
+    thickness: float
+    layers: int
+    fire_rating: Optional[Union[str, float]]
+    waste_factor: Union[str, int, float]
+
+    @field_validator("thickness")
+    @classmethod
+    def validate_float(cls, v):
+        return ensure_not_nan(v)
+
+    @field_validator("color_code")
+    @classmethod
+    def validate_bgr(cls, v):
+        if len(v) != 3:
+            raise ValueError("color_code must be BGR tuple")
+        if not all(0 <= c <= 255 for c in v):
+            raise ValueError("Invalid BGR value")
+        return v
+
+class DrywallAssemblyWall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    material: str
+    color_code: Tuple[int, int, int]
+    materials_vertically_stacked: List
+    color_codes_stacked: List
+    thickness: float
+    layers: int
+    fire_rating: Optional[Union[str, float]]
+    waste_factor: Union[str, int, float]
+
+    @field_validator("thickness")
+    @classmethod
+    def validate_float(cls, v):
+        return ensure_not_nan(v)
+
+    @field_validator("color_code")
+    @classmethod
+    def validate_bgr(cls, v):
+        if len(v) != 3:
+            raise ValueError("color_code must be BGR tuple")
+        if not all(0 <= c <= 255 for c in v):
+            raise ValueError("Invalid BGR value")
+        return v
+
+class Ceiling(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    room_name: Optional[str]
+    area: float
+    confidence_area: float = Field(ge=0, le=1)
+    ceiling_type: str
+    height: float
+    confidence_height: float = Field(ge=0, le=1)
+    slope: float
+    slope_enabled: bool
+    tilt_axis: Optional[Literal["horizontal", "vertical", "NULL"]]
+    drywall_assembly: DrywallAssemblyCeiling
+    code_references: List[str]
+    recommendation: Optional[str]
+
+    @field_validator("area", "height", "slope")
+    @classmethod
+    def validate_float(cls, v):
+        return ensure_not_nan(v)
+
+class WallParameter(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    room_name: Optional[str]
+    length: float
+    confidence_length: float = Field(ge=0, le=1)
+    width: Optional[float]
+    height: float
+    confidence_height: float = Field(ge=0, le=1)
+    wall_type: str
+    drywall_assembly: DrywallAssemblyWall
+    code_references: List[str]
+    recommendation: Optional[str]
+
+    @field_validator("length", "height")
+    @classmethod
+    def validate_float(cls, v):
+        return ensure_not_nan(v)
+
+    @field_validator("width")
+    @classmethod
+    def validate_optional_float(cls, v):
+        if v is None:
+            return v
+        return ensure_not_nan(v)
+
+class DrywallPredictorCaliforniaResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ceiling: Ceiling
+    wall_parameters: List[WallParameter]
+
+    @model_validator(mode="after")
+    def check_wall_count(self):
+        if len(self.wall_parameters) < 1:
+            raise ValueError("At least one wall required")
+        return self
+
+FEEDBACK_GENERATOR = """
+  INTERNAL SELF-REVIEW (Do not skip):
+    You are given {max_retry} attempts to retry the generation process and the following are the list of errors encountered during your previous attempts.
+    {exceptions}
+    STRICTY confirm no previous error remains before producing the final output.
+"""
+
+SCALE_AND_CEILING_HEIGHT_DETECTOR = """
+  You are an expert architectural drawing text parser
+
+  PROVIDED:
+    1. A snapshot of the full Architectural Drawing in png format with the following highlight,
+      - The target drawing of interest is highlighted with a green bounding box that encloses architectural plan(s) with a very tight aproximation.
+
+  TASK:
+    Identify the standard `ceiling_height` and `scale` mentioned in the transcription entries for the highlighted floorplan.
+    INSTRUCTIONS:
+      - Look for a keyword that matches with `ceiling height` field at the title section of the highlighted drawing and identify the numerical entity closest to it. Note the feet equivalent of it.
+      - Look for a keyword that has to do with the `scale` of the highlighted drawing, representing the ratio between the length on paper and the real world length in floating point values. Normalize and capture the ratio as "<paper_length_in_inches>``: <real_world_length_in_feet>`<real_world_length_in_inches>``".
+          Example: 0.25``:1`0``
+      - If multiple ceiling heights are listed, extract the standard or typical one.
+      - If scale is written in multiple formats, preserve the exact textual format.
+      - If not present, return null.
+
+  OUTPUT:
+    Your output should be in the JSON format containing the standard `ceiling_height` and `scale` of the floorplan.
+    **STRICTLY** Do not generate additional content apart from the designated JSON.
+    Please refer the following as a reference and ensure to replace every consecutive pair of open/closed curly braces with a single one during the generation of the output.
+    {{
+        "ceiling_height": <Standard ceiling height mentioned in the transcriptions converted to feet in float>,
+        "scale": "<Scale of the drawing mentioned in the transcriptions i.e. number_in_inches``: number_in_feet`number_in_inches``>"
+    }}
+"""
+
+class ScaleAndCeilingHeightDetectorResponse(BaseModel):
+    ceiling_height: Union[float, int]
+    scale: str
+
+ARCHITECTURAL_DRAWING_CLASSIFIER = """
+    You are an expert architectural drawing classifier.
+
+    PROVIDED:
+        A single page extracted from an architectural construction plan project document entitled to a planned residence in `PNG` format.
+
+    TASK:
+        Classify the construction drawing into exactly ONE of the following categories:
+
+        - FLOOR_PLAN
+        - ROOF_PLAN
+        - ELECTRICAL_PLAN
+        - FOUNDATION_PLAN
+        - ELEVATION_PLAN
+        - NOT_ARCHITECTURAL_PLAN
+
+        INSTRUCTIONS:
+        - Choose exactly one category from the allowed list.
+        - Use architectural conventions (symbols, annotations, layout, views).
+        - Consider labels, dimensions, symbols, and drawing orientation.
+        - A page containing architecture plan will contain the architecture metadata information in text at the stray sections of the image, usually at the right and bottom section of the image. Generate a mask factor containing the information on the stray section of the image following the below instrution,
+            - Generate the horizontal `mask_factor` (boundary -> [0, 1]) of the image by determining the fraction of the total width of the image that contains text information and isolated from the architecture drawing on the page on the right-most section of the page.
+            - Generate the vertical `mask_factor` (boundary -> [0, 1]) of the image by determining the fraction of the total height of the image that contains text information and isolated from the architecture drawing on the page on the bottom-most section of the page.
+        - A page may contain one or more architecture drawings. Compute bounding box or visual grounding offset for each of the available drawings with offset containing `TOP-LEFT` and `BOTTOM-RIGHT` corner of the bounding box) and produce a list of bounding box offsets.
+            - REMEMBER, `TOPMOST-LEFTMOST` of the page is considered as the origin to compute the bounding box offset from.
+            - The offsets should be computed in fraction [0, 1] to represent the bounding box. If a `TOP-LEFT` of a bounding box lies in a point which is at a distance of 0.5 of the total width of the page from the origin in X-direction (towards `RIGHT`) and at a distance of 0.25 of the total height of the page from the origin in Y-direction (towards `DOWN`), then the `TOP-LEFT` offset of the bounding box should be (0.5, 0.25). Apply same rule to compute `BOTTOM-RIGHT` offset of a bounding box.
+            - STRICTLY REMEMBER, the visual grounding computed for each of the drawings should be precise, such that it tightly encloses that drawing while capturing its relevant outermost lines (dimension lines, wall lines or any extended artifact but excluding the margin-lines / outermost bounding-box lines) and the title of the drawing (if present in the neighborhood).
+        - Identify the title of each of the available/identified architecture drawings, typically found at the bottom of each of the drawings and associate it to the respective visual-grounding/bounding-box offsets.
+            - If respective drawing titles cannot be identified, use the title as `FLOOR_PLAN_<unique_identification_number>` with unique identification number for each of the identified architecture drawings.
+            - STRICTLY REMEMBER, the titles must be unique. If duplicate titles are observed across the identified architecture drawings, add alpha-numerical suffixes to ensure they are unique.
+
+        Base your decision only on visual and textual evidence present in the drawing.
+
+        If the drawing does not clearly represent an architectural or construction plan, classify it as NOT_ARCHITECTURAL_PLAN.
+
+        Do not guess.
+        Do not invent details.
+        If uncertain, choose the most defensible category based on evidence.
+
+    OUTPUT:
+        Your output must be precise, code-aligned, and structured. You must reason spatially and geometrically. Do NOT describe the image.
+        **STRICTLY**
+        - Do not generate additional content apart from the designated JSON.
+        Please refer the following as a reference and ensure to replace every consecutive pair of open/closed curly braces with a single one during the generation of the output.
+        **STRICTLY FOLLOW**
+          - The `bounding_box_offsets` field value should always be a non-empty list. 
+        {{
+            "plan_type": "<FLOOR_PLAN>/<ROOF_PLAN>/<ELECTRICAL_PLAN>/<FOUNDATION_PLAN>/<ELEVATION_PLAN>/<NOT_ARCHITECTURAL_PLAN>",
+            "mask_factor":
+                {{
+                    "horizontal": <mask factor for the width of the image in float rounded upto 2 decimal places>,
+                    "vertical": <mask factor for the height of the image in float rounded upto 2 decimal places>
+                }}
+            "bounding_box_offsets":
+                [
+                    {{"offset_top_left": <`TOP-LEFT` offset of the bounding-box for architecture drawing 1>, "offset_bottom_right": <`BOTTOM-RIGHT` offset of the bounding-box for architecture drawing 1>, "title": "<identified title of the architecture drawing 1>"}},
+                    {{"offset_top_left": <`TOP-LEFT` offset of the bounding-box for architecture drawing 2>, "offset_bottom_right": <`BOTTOM-RIGHT` offset of the bounding-box for architecture drawing 2>, "title": "<identified title of the architecture drawing 2>"}}
+                ]
+        }}
+"""
+
+class ArchitecturalDrawingClassifierResponse(BaseModel):
+    plan_type: str
+    mask_factor: Dict
+    bounding_box_offsets: List[Dict]
+
+    @model_validator(mode="after")
+    def check_offset_count(self):
+        if len(self.bounding_box_offsets) < 1:
+            raise ValueError("At least one bounding box offset is needed")
+        return self
+
+CEILING_CHOICES = [
+    "Flat",
+    "Single-sloped",
+    "Gable",
+    "Tray",
+    "Barrel vault",
+    "Coffered",
+    "Combination",
+    "Soffit",
+    "Cove",
+    "Dome",
+    "Cloister Vault",
+    "Knee-Wall",
+    "Cathedral with Flat Center",
+    "Angled-Plane",
+    "Boxed-Beam"
+]
+
+WALL_CHOICES = [
+  {"wall_type": "OPEN_TO_BELOW", "is_height_static": False},
+  {"wall_type": "FULL_WALL", "is_height_static": True},
+  {"wall_type": "HALF_WALL", "is_height_static": False},
+  {"wall_type": "STAIRCASE_WALL", "is_height_static": False},
+  {"wall_type": "SOFFITS", "is_height_static": False},
+  {"wall_type": "MULTI_FLOOR_ALIGNMENT", "is_height_static": False},
+  {"wall_type": "DEMISING_WALL", "is_height_static": True},
+  {"wall_type": "GARAGE_SEPARATION_WALL", "is_height_static": True},
+  {"wall_type": "SHAFT_WALL", "is_height_static": False},
+  {"wall_type": "WET_WALL", "is_height_static": False},
+  {"wall_type": "HALLWAY_WALL", "is_height_static": True} 
+]

@@ -1,0 +1,80 @@
+# Exclude plan2walls entirely
+plan2walls/
+
+# Keys and credentials
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!composer.json
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*service-account*
+*sa-key*
+*secrets*
+.env
+.env.*
+
+# Large files
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+*.pkl
+*.h5
+*.hdf5
+*.model
+*.weights
+*.ckpt
+*.pb
+*.tflite
+*.onnx
+*.pt
+*.pth
+*.bin
+*.dat
+*.npy
+*.npz
+
+# Large image/data files
+*.tif
+*.tiff
+*.bmp
+*.raw
+
+# GeoIP database
+*.mmdb
+
+# Generated output files
+output.svg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+
+# Docker
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
