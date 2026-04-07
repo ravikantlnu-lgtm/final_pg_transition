@@ -48,8 +48,8 @@ PostgreSQL:
     database: drywall_takeoff
     user: postgres
     password: Drywall@2026
-    min_pool_size: 2
-    max_pool_size: 10
+    min_pool_size: 1
+    max_pool_size: 3
     table_name_projects: projects
     table_name_plans: plans
     table_name_models: models
