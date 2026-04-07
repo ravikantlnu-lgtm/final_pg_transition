@@ -442,7 +442,7 @@ def insert_project(payload_project, bigquery_client, credentials):
         project_id,
         project_name,
         project_location,
-        FBM_branch,
+        "FBM_branch",
         project_type,
         project_area,
         contractor_name,
@@ -523,7 +523,11 @@ def load_gcp_credentials() -> dict:
     yaml = YAML(typ="safe", pure=True)
     with open("gcp.yaml", 'r') as f:
         credentials = yaml.load(f)
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials["service_drywall_account_key"]
+    # ADC: Cloud Run uses the attached service account automatically.
+    # Only set GOOGLE_APPLICATION_CREDENTIALS if the key file exists locally.
+    key_file = credentials.get("service_drywall_account_key", "")
+    if key_file and os.path.exists(key_file):
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = key_file
 
     return credentials
 
