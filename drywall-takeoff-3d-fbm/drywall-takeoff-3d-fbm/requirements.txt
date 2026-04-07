@@ -3,6 +3,7 @@
 # Manually managing azure-functions-worker may cause unexpected issues
 
 google-cloud-storage
+google-cloud-secret-manager
 psycopg2-binary
 vertexai==1.43.0
 google-auth
