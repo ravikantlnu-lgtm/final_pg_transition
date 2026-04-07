@@ -13,6 +13,7 @@ pypdf
 pdf2image
 pydantic
 python-multipart
+requests
 pandas
 google-cloud-pubsub
 openpyxl

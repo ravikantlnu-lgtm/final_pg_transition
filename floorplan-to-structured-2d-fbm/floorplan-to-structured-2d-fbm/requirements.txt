@@ -17,6 +17,8 @@ pdf2image
 pydantic
 python-Levenshtein
 python-multipart
+pandas
+requests
 scikit-image
 opencv-python
 geoip2
